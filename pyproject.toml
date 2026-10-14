@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eo-multimodal-fuse"
+version = "0.1.0"
+description = "Toy multimodal EO fusion: optical + SAR-like proxies, baseline vs fusion metrics"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.1.0",
+  "numpy>=1.26.0",
+  "matplotlib>=3.8.0",
+  "scikit-learn>=1.3.0",
+]
+
+[project.scripts]
+eo-multimodal-fuse = "eo_multimodal_fuse.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
