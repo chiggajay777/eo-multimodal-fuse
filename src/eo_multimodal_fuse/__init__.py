@@ -1,3 +1,3 @@
-"""eo-multimodal-fuse: optical + SAR-like fusion toy experiment."""
+"""eo-multimodal-fuse: Sentinel-1/2 fusion vs unimodal baselines."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -1,78 +1,50 @@
-"""Train unimodal baselines vs fusion; emit metrics table + figure."""
+"""Synthetic dual-modality demo.
+
+Offline fallback for the Sentinel benchmark. Metrics use the same non-NaN
+scorer as the real run, including both missing-modality conditions.
+"""
 
 from __future__ import annotations
 
-import json
+import time
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from torch.utils.data import DataLoader
 
 from eo_multimodal_fuse.data import make_loaders
+from eo_multimodal_fuse.engine import predict, train_model
+from eo_multimodal_fuse.metrics import (
+    SEED_COLUMNS,
+    SUMMARY_COLUMNS,
+    aggregate,
+    class_weights,
+    markdown_table,
+    safe_scores,
+    write_csv,
+    write_json,
+)
 from eo_multimodal_fuse.models import CrossAttentionFusion, LateFusion, MLP
+from eo_multimodal_fuse.plots import plot_full_modality, plot_missing_modality
 
-
-def _train(model, loader, device, epochs, lr, multimodal: bool):
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    crit = nn.CrossEntropyLoss()
-    model.train()
-    for _ in range(epochs):
-        for batch in loader:
-            if multimodal:
-                x_opt, x_sar, y = batch
-                x_opt, x_sar, y = x_opt.to(device), x_sar.to(device), y.to(device)
-                logits = model(x_opt, x_sar)
-            else:
-                x, y = batch
-                x, y = x.to(device), y.to(device)
-                logits = model(x)
-            opt.zero_grad()
-            loss = crit(logits, y)
-            loss.backward()
-            opt.step()
-
-
-def _eval(model, loader, device, multimodal: bool) -> dict:
-    model.eval()
-    ys, ps, pr = [], [], []
-    with torch.no_grad():
-        for batch in loader:
-            if multimodal:
-                x_opt, x_sar, y = batch
-                x_opt, x_sar = x_opt.to(device), x_sar.to(device)
-                logits = model(x_opt, x_sar)
-            else:
-                x, y = batch
-                x = x.to(device)
-                logits = model(x)
-            prob = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            pred = logits.argmax(dim=1).cpu().numpy()
-            ys.append(y.numpy())
-            ps.append(pred)
-            pr.append(prob)
-    y_true = np.concatenate(ys)
-    y_pred = np.concatenate(ps)
-    y_prob = np.concatenate(pr)
-    out = {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-    }
-    try:
-        out["auroc"] = float(roc_auc_score(y_true, y_prob))
-    except ValueError:
-        out["auroc"] = float("nan")
-    return out
+DEMO_FULL = [
+    "optical_only",
+    "sar_only",
+    "late_fusion",
+    "late_fusion_moddrop",
+    "cross_attention_fusion",
+    "cross_attention_fusion_moddrop",
+]
+DEMO_FUSION = [
+    "late_fusion",
+    "late_fusion_moddrop",
+    "cross_attention_fusion",
+    "cross_attention_fusion_moddrop",
+]
 
 
 class _UniLoader:
-    """Wrap dual loader to expose one modality."""
-
     def __init__(self, base, which: str):
         self.base = base
         self.which = which
@@ -80,6 +52,16 @@ class _UniLoader:
     def __iter__(self):
         for opt, sar, y in self.base:
             yield (opt if self.which == "opt" else sar), y
+
+
+def _score(model, loader, device, multimodal: bool, missing: str | None) -> dict:
+    labels, preds, probs, n_bad = predict(
+        model, loader, device=device, multimodal=multimodal, missing=missing
+    )
+    scores = safe_scores(np.concatenate(labels), np.concatenate(preds), np.concatenate(probs))
+    if n_bad:
+        scores["notes"].append(f"non-finite logits replaced with zeros on {n_bad} samples")
+    return scores
 
 
 def run_demo(
@@ -90,101 +72,81 @@ def run_demo(
     batch_size: int = 64,
     seed: int = 42,
     device: str | None = None,
+    modality_dropout: float = 0.5,
+    lr: float = 1e-3,
 ) -> dict:
+    """Single-seed synthetic run. Not the reported benchmark."""
+    started = time.perf_counter()
     out_dir = Path(out_dir)
-    fig_dir = out_dir / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
-
+    out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    np.random.seed(seed)
+    dev = torch.device(device or "cpu")
     train_loader, val_loader = make_loaders(n=n, batch_size=batch_size, seed=seed)
+    train_y = []
+    for batch in train_loader:
+        train_y.append(batch[-1].numpy())
+    weight = torch.tensor(class_weights(np.concatenate(train_y)), dtype=torch.float32)
 
-    results_methods = []
+    specs = [
+        ("optical_only", MLP(4), False, 0.0, "opt"),
+        ("sar_only", MLP(4), False, 0.0, "sar"),
+        ("late_fusion", LateFusion(), True, 0.0, None),
+        ("late_fusion_moddrop", LateFusion(), True, modality_dropout, None),
+        ("cross_attention_fusion", CrossAttentionFusion(), True, 0.0, None),
+        ("cross_attention_fusion_moddrop", CrossAttentionFusion(), True, modality_dropout, None),
+    ]
+    rows = []
+    for name, model, multimodal, drop_p, which in specs:
+        model = model.to(dev)
+        source_train = _UniLoader(train_loader, which) if not multimodal else train_loader
+        source_val = _UniLoader(val_loader, which) if not multimodal else val_loader
+        train_model(
+            model,
+            source_train,
+            device=dev,
+            epochs=epochs,
+            lr=lr,
+            multimodal=multimodal,
+            class_weight=weight,
+            modality_dropout=drop_p if multimodal else 0.0,
+            augment=False,
+        )
+        conditions = [("full", None)]
+        if multimodal:
+            conditions.extend([("optical_missing", "optical"), ("sar_missing", "sar")])
+        for condition, missing in conditions:
+            scores = _score(model, source_val, dev, multimodal, missing)
+            rows.append({"split": "synthetic", "method": name, "condition": condition, "seed": seed, **scores})
 
-    # Optical-only
-    m_opt = MLP(4).to(dev)
-    _train(m_opt, _UniLoader(train_loader, "opt"), dev, epochs, 1e-3, multimodal=False)
-    metrics = _eval(m_opt, _UniLoader(val_loader, "opt"), dev, multimodal=False)
-    results_methods.append({"name": "optical_only", **metrics})
-
-    # SAR-only
-    m_sar = MLP(4).to(dev)
-    _train(m_sar, _UniLoader(train_loader, "sar"), dev, epochs, 1e-3, multimodal=False)
-    metrics = _eval(m_sar, _UniLoader(val_loader, "sar"), dev, multimodal=False)
-    results_methods.append({"name": "sar_only", **metrics})
-
-    # Late fusion
-    m_late = LateFusion().to(dev)
-    _train(m_late, train_loader, dev, epochs, 1e-3, multimodal=True)
-    metrics = _eval(m_late, val_loader, dev, multimodal=True)
-    results_methods.append({"name": "late_fusion", **metrics})
-
-    # Cross-attention fusion
-    m_xattn = CrossAttentionFusion().to(dev)
-    _train(m_xattn, train_loader, dev, epochs, 1e-3, multimodal=True)
-    metrics = _eval(m_xattn, val_loader, dev, multimodal=True)
-    results_methods.append({"name": "cross_attention_fusion", **metrics})
-
-    # Missing-modality robustness: late fusion with SAR zeros at val
-    m_late.eval()
-    ys, ps = [], []
-    with torch.no_grad():
-        for opt, sar, y in val_loader:
-            opt = opt.to(dev)
-            sar0 = torch.zeros_like(sar).to(dev)
-            pred = m_late(opt, sar0).argmax(dim=1).cpu().numpy()
-            ys.append(y.numpy())
-            ps.append(pred)
-    miss_acc = float(accuracy_score(np.concatenate(ys), np.concatenate(ps)))
-    results_methods.append(
-        {
-            "name": "late_fusion_sar_missing",
-            "accuracy": miss_acc,
-            "f1": float("nan"),
-            "auroc": float("nan"),
-            "note": "SAR inputs zeroed at eval — robustness check",
-        }
-    )
-
+    summary = aggregate(rows)
     payload = {
-        "device": str(dev),
-        "dataset": "Synthetic optical(4) + SAR-like(4) binary risk",
+        "dataset": "synthetic optical(4) + SAR-like(4) binary labels",
+        "note": "Offline demo. Reported portfolio numbers come from the Sen1Floods11 run.",
         "n_samples": n,
         "epochs": epochs,
-        "methods": results_methods,
+        "seed": seed,
+        "device": str(dev),
+        "modality_dropout": modality_dropout,
+        "per_seed": rows,
+        "summary": summary,
+        "runtime_seconds": time.perf_counter() - started,
     }
-
-    (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    csv_lines = ["method,accuracy,f1,auroc"]
-    for m in results_methods:
-        csv_lines.append(
-            f"{m['name']},{m.get('accuracy', '')},{m.get('f1', '')},{m.get('auroc', '')}"
-        )
-    csv_path = out_dir / "metrics_table.csv"
-    csv_path.write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
-
-    # Figure — accuracy bars for main methods
-    main = [m for m in results_methods if m["name"] != "late_fusion_sar_missing"]
-    names = [m["name"] for m in main]
-    accs = [m["accuracy"] for m in main]
-    fig, ax = plt.subplots(figsize=(8, 4))
-    colors = ["#90be6d", "#f9c74f", "#577590", "#43aa8b"]
-    bars = ax.bar(names, accs, color=colors)
-    ax.set_ylim(0, 1.05)
-    ax.set_ylabel("Validation accuracy")
-    ax.set_title("eo-multimodal-fuse — baseline vs fusion")
-    plt.setp(ax.get_xticklabels(), rotation=15, ha="right")
-    for b, a in zip(bars, accs):
-        ax.text(b.get_x() + b.get_width() / 2, a + 0.02, f"{a:.3f}", ha="center", fontsize=9)
-    fig.tight_layout()
-    fig_path = fig_dir / "fusion_accuracy.png"
-    fig.savefig(fig_path, dpi=120)
-    plt.close(fig)
-
+    write_json(out_dir / "metrics.json", payload)
+    write_csv(out_dir / "metrics_table.csv", summary, SUMMARY_COLUMNS)
+    write_csv(out_dir / "metrics_by_seed.csv", rows, SEED_COLUMNS)
+    table = markdown_table(summary, "synthetic", DEMO_FULL, ["full"])
+    table += "\n" + markdown_table(summary, "synthetic", DEMO_FUSION, ["full", "optical_missing", "sar_missing"])
+    (out_dir / "table.md").write_text(table, encoding="utf-8")
+    plot_full_modality(
+        summary, out_dir / "figures" / "fusion_accuracy.png", split="synthetic", methods=DEMO_FULL
+    )
+    plot_missing_modality(
+        summary, out_dir / "figures" / "missing_modality.png", split="synthetic", methods=DEMO_FUSION
+    )
     payload["artifacts"] = {
         "metrics_json": str(out_dir / "metrics.json"),
-        "metrics_csv": str(csv_path),
-        "figure": str(fig_path),
+        "metrics_csv": str(out_dir / "metrics_table.csv"),
+        "figure": str(out_dir / "figures" / "fusion_accuracy.png"),
     }
     return payload

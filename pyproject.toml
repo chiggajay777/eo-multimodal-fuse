@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eo-multimodal-fuse"
-version = "0.1.0"
-description = "Toy multimodal EO fusion: optical + SAR-like proxies, baseline vs fusion metrics"
+version = "0.2.0"
+description = "Sentinel-1/2 fusion vs unimodal baselines, with a synthetic offline demo"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
   "numpy>=1.26.0",
   "matplotlib>=3.8.0",
   "scikit-learn>=1.3.0",
+  "rasterio>=1.4.0",
 ]
 
 [project.scripts]

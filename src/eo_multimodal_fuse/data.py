@@ -1,4 +1,4 @@
-"""Synthetic dual-modality samples.
+"""Synthetic dual-modality samples for the offline ``--demo`` path.
 
 Modality A: optical-like RGB stats (NDVI proxy, brightness, greenness).
 Modality B: SAR-like proxies (backscatter mean/std, texture).
